@@ -1,0 +1,354 @@
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:your_app/models/weather_data.dart';
+import 'package:your_app/screens/auth_screen.dart';
+import 'package:your_app/screens/home_screen.dart';
+import 'package:your_app/services/weather_api_service.dart';
+import 'package:your_app/services/firebase_service.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Weather App',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+      ),
+      home: StreamBuilder<User?>(
+        stream: FirebaseAuth.instance.authStateChanges(),
+        builder: (context, snapshot) {
+          if (snapshot.hasData) {
+            return HomeScreen();
+          } else {
+            return AuthScreen();
+          }
+        },
+      ),
+    );
+  }
+}
+
+class HomeScreen extends StatefulWidget {
+  @override
+  _HomeScreenState createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final FirebaseMessaging _fcm = FirebaseMessaging.instance;
+  String? _fcmToken;
+  Location? _location;
+  WeatherData? _weatherData;
+  bool _isLoading = false;
+  List<WeatherAlert> _alertHistory = [];
+  Map<String, Marker> _markers = {};
+  late GoogleMapController _mapController;
+  String? _selectedLocation;
+  bool _isAutoLocationEnabled = true;
+
+  final _dateFormat = DateFormat('yyyy-MM-dd HH:mm');
+
+  @override
+  void initState() {
+    super.initState();
+    _requestLocationPermissions();
+    _getToken();
+    _initFcm();
+    _fetchAlertHistory();
+  }
+
+  Future<void> _requestLocationPermissions() async {
+    LocationPermission permission = await Geolocator.requestPermission();
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      // Handle the case where the user denied location permissions
+    }
+  }
+
+  Future<void> _getToken() async {
+    _fcmToken = await _fcm.getToken();
+    await FirebaseService.saveFcmToken(_fcmToken!);
+  }
+
+  void _initFcm() {
+    _fcm.requestPermission();
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      _handleNotification(message);
+    });
+  }
+
+  Future<void> _fetchAlertHistory() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    List<String>? historyData = prefs.getStringList('alert_history');
+    if (historyData != null) {
+      _alertHistory = historyData.map((json) => WeatherAlert.fromJson(json)).toList();
+    }
+    setState(() {});
+  }
+
+  Future<void> _fetchWeatherData() async {
+    if (_isAutoLocationEnabled && _location != null) {
+      _selectedLocation = null;
+    } else if (_selectedLocation != null) {
+      _location = await Geolocator.getLocationFromAddress(_selectedLocation!);
+    }
+    setState(() {
+      _isLoading = true;
+    });
+    try {
+      if (_location != null) {
+        _weatherData = await WeatherApiService.getWeatherData(
+          _location!.latitude,
+          _location!.longitude,
+        );
+        _updateMarkers();
+      }
+      setState(() {});
+    } catch (e) {
+      // Handle API errors
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  void _updateMarkers() {
+    if (_weatherData != null && _location != null) {
+      _markers.clear();
+      _markers[(_location!.latitude).toString() +
+          '_' +
+          (_location!.longitude).toString()] = Marker(
+        markerId: MarkerId(
+            (_location!.latitude).toString() +
+                '_' +
+                (_location!.longitude).toString()),
+        position: LatLng(_location!.latitude, _location!.longitude),
+        infoWindow: InfoWindow(
+          title: _weatherData!.locationName,
+          snippet: _weatherData!.description,
+        ),
+      );
+    }
+  }
+
+  void _handleNotification(RemoteMessage message) {
+    WeatherAlert alert = WeatherAlert.fromJson(message.data);
+    _alertHistory.add(alert);
+    SharedPreferences.getInstance().then((prefs) {
+      prefs.setStringList('alert_history',
+          _alertHistory.map((alert) => alert.toJson()).toList());
+    });
+    setState(() {});
+  }
+
+  void _sendNotification(String message) {
+    _fcm.send(
+      message: message,
+      topic: 'weather_alerts', // Or use a topic for location-based alerts
+    );
+  }
+
+  void _checkBadWeather(WeatherData weatherData) {
+    // Implement bad weather logic here
+    if (weatherData.main.temp < 10) {
+      // Trigger notification for cold weather
+      _sendNotification(
+          'Cold weather alert! Temperature is below 10 degrees Celsius.');
+    }
+  }
+
+  void _signOut() {
+    FirebaseAuth.instance.signOut();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Weather App'),
+        actions: [
+          IconButton(
+            onPressed: _signOut,
+            icon: Icon(Icons.logout),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          _isLoading
+              ? Center(
+                  child: CircularProgressIndicator(),
+                )
+              : Column(
+                  children: [
+                    Container(
+                      height: 200,
+                      child: GoogleMap(
+                        initialCameraPosition: CameraPosition(
+                          target: _location != null
+                              ? LatLng(_location!.latitude, _location!.longitude)
+                              : LatLng(40.7128, -74.0060),
+                          zoom: 10,
+                        ),
+                        onMapCreated: (GoogleMapController controller) {
+                          _mapController = controller;
+                          _updateMarkers();
+                        },
+                        markers: _markers.values.toSet(),
+                      ),
+                    ),
+                    Expanded(
+                      child: SingleChildScrollView(
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (_location != null)
+                                Text(
+                                  'Current Location: ${_weatherData?.locationName ?? 'Fetching Location...'}',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 18,
+                                  ),
+                                ),
+                              if (_weatherData != null)
+                                Column(
+                                  children: [
+                                    Text(
+                                      'Weather: ${_weatherData!.description}',
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                      ),
+                                    ),
+                                    Text(
+                                      'Temperature: ${_weatherData!.main.temp}°C',
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                      ),
+                                    ),
+                                    Text(
+                                      'Humidity: ${_weatherData!.main.humidity}%',
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                      ),
+                                    ),
+                                    // ... Display other weather details
+                                  ],
+                                ),
+                              SizedBox(height: 16),
+                              Text(
+                                'Alerts History',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 18,
+                                ),
+                              ),
+                              ListView.builder(
+                                shrinkWrap: true,
+                                physics: NeverScrollableScrollPhysics(),
+                                itemCount: _alertHistory.length,
+                                itemBuilder: (context, index) {
+                                  WeatherAlert alert = _alertHistory[index];
+                                  return ListTile(
+                                    title: Text(
+                                      alert.description,
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                      ),
+                                    ),
+                                    subtitle: Text(
+                                      '${_dateFormat.format(alert.timestamp)}',
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        color: Colors.grey,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                              SizedBox(height: 16),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: ElevatedButton(
+                                      onPressed: _fetchWeatherData,
+                                      child: Text('Get Weather'),
+                                    ),
+                                  ),
+                                  SizedBox(width: 16),
+                                  Expanded(
+                                    child: ElevatedButton(
+                                      onPressed: () {
+                                        setState(() {
+                                          _isAutoLocationEnabled = !_isAutoLocationEnabled;
+                                        });
+                                      },
+                                      child: Text(
+                                        _isAutoLocationEnabled
+                                            ? 'Disable Auto Location'
+                                            : 'Enable Auto Location',
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              SizedBox(height: 16),
+                              if (!_isAutoLocationEnabled)
+                                TextField(
+                                  onChanged: (value) {
+                                    _selectedLocation = value;
+                                  },
+                                  decoration: InputDecoration(
+                                    hintText: 'Enter Location',
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+          if (_isLoading)
+            Center(
+              child: CircularProgressIndicator(),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class WeatherAlert {
+  final String description;
+  final DateTime timestamp;
+
+  WeatherAlert({required this.description, required this.timestamp});
+
+  factory WeatherAlert.fromJson(Map<String, dynamic> json) {
+    return WeatherAlert(
+      description: json['description'],
+      timestamp: DateTime.parse(json['timestamp']),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'description': description,
+      'timestamp': timestamp.toIso8601String(),
+    };
+  }
+}
